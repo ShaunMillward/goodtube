@@ -1,0 +1,186 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Feed</title>
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="apple-touch-icon" href="icon.png">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="Feed">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="theme-color" content="#14181f">
+<style>
+:root{--bg:#f4f6f8;--card:#fff;--ink:#14181f;--mute:#667085;--line:#dde2e8;--acc:#0f766e;--seen:.45;color-scheme:light dark}
+@media(prefers-color-scheme:dark){:root{--bg:#14181f;--card:#1c222b;--ink:#eef1f5;--mute:#98a2b3;--line:#2b3340;--acc:#5eead4}}
+*{box-sizing:border-box}
+html,body{margin:0;background:var(--bg);color:var(--ink);font:16px/1.4 -apple-system,system-ui,sans-serif}
+:root{padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}
+header{position:sticky;top:env(safe-area-inset-top,0px);background:var(--bg);display:flex;align-items:center;justify-content:space-between;padding:12px 16px;border-bottom:1px solid var(--line);z-index:5}
+body::before{content:"";position:fixed;inset:0 0 auto;height:env(safe-area-inset-top,0px);background:var(--bg);z-index:10}
+h1{font-size:20px;margin:0}
+button{font:inherit;color:inherit;background:none;border:0;padding:8px;cursor:pointer}
+button:focus-visible,a:focus-visible{outline:2px solid var(--acc);outline-offset:2px}
+.bar button{color:var(--acc);font-weight:600}
+main{max-width:640px;margin:0 auto;padding:12px 16px 40px}
+.v{display:block;width:100%;text-align:left;padding:0;margin:0 0 20px}
+.v img{width:100%;aspect-ratio:16/9;object-fit:cover;border-radius:10px;background:var(--line);display:block}
+.v .t{margin:8px 2px 0;font-weight:600}
+.v .m{margin:2px 2px 0;color:var(--mute);font-size:14px}
+.v.seen{opacity:var(--seen)}
+.empty,.err{color:var(--mute);padding:32px 0;text-align:center}
+.err{color:#b42318}
+#player{position:fixed;inset:0;background:#000;z-index:20;display:none;flex-direction:column;padding-top:env(safe-area-inset-top,0px)}
+#player.on{display:flex}
+#player .top{display:flex;justify-content:space-between;color:#fff;padding:4px 8px}
+#player button{color:#fff}
+#player iframe{border:0;width:100%;aspect-ratio:16/9}
+#panel{position:fixed;inset:0;background:var(--bg);z-index:15;display:none;overflow:auto;padding:calc(env(safe-area-inset-top,0px) + 12px) 16px 40px}
+#panel.on{display:block}
+#panel .in{max-width:640px;margin:0 auto}
+.row{display:flex;justify-content:space-between;align-items:center;padding:10px 0;border-bottom:1px solid var(--line)}
+.row button{color:#b42318}
+input{font:inherit;width:100%;padding:10px 12px;border-radius:8px;border:1px solid var(--line);background:var(--card);color:var(--ink)}
+.add{display:flex;gap:8px;margin:16px 0}
+.add button{background:var(--acc);color:var(--bg);border-radius:8px;font-weight:600;padding:8px 16px}
+</style>
+</head>
+<body>
+<header class="bar">
+  <h1>Feed</h1>
+  <span><button id="refresh">Refresh</button><button id="edit">Channels</button></span>
+</header>
+<main id="list"></main>
+
+<div id="player">
+  <div class="top"><button id="close">Close</button><button id="yt">Mark unwatched</button></div>
+  <iframe id="frame" allow="autoplay; picture-in-picture; fullscreen" allowfullscreen referrerpolicy="strict-origin-when-cross-origin"></iframe>
+</div>
+
+<div id="panel"><div class="in">
+  <div class="bar" style="display:flex;justify-content:space-between;align-items:center"><h1>Channels</h1><button id="done">Done</button></div>
+  <div class="add"><input id="handle" placeholder="@handle or channel ID (UC…)" autocapitalize="off" autocorrect="off"><button id="addBtn">Add</button></div>
+  <div id="msg" class="err" style="padding:0 0 8px;text-align:left"></div>
+  <div id="chans"></div>
+</div></div>
+
+<script>
+// 1. After deploying the Worker, paste its URL here (no trailing slash).
+const API = "https://late-mountain-f304.shaun-millward.workers.dev/";
+
+const $ = id => document.getElementById(id);
+const load = (k, d) => { try { return JSON.parse(localStorage.getItem(k)) ?? d; } catch { return d; } };
+const save = (k, v) => { try { localStorage.setItem(k, JSON.stringify(v)); } catch {} };
+
+let channels = load("channels", []);   // [{id, name}]
+let seen = load("seen", {});           // {videoId: 1}
+let videos = load("videos", []);       // cached feed
+let current = null;
+
+const ago = d => {
+  const s = (Date.now() - new Date(d)) / 1000;
+  for (const [n, u] of [[86400*365,"year"],[86400*30,"month"],[86400*7,"week"],[86400,"day"],[3600,"hour"],[60,"minute"]])
+    if (s >= n) { const c = Math.floor(s / n); return `${c} ${u}${c > 1 ? "s" : ""} ago`; }
+  return "just now";
+};
+
+function render(error) {
+  const el = $("list");
+  el.textContent = "";
+  if (error) { const e = document.createElement("div"); e.className = "err"; e.textContent = error; el.append(e); }
+  if (!channels.length) {
+    const e = document.createElement("div"); e.className = "empty";
+    e.textContent = "No channels yet. Tap Channels to add one."; el.append(e); return;
+  }
+  for (const v of videos) {
+    const b = document.createElement("button");
+    b.className = "v" + (seen[v.id] ? " seen" : "");
+    const img = document.createElement("img");
+    img.loading = "lazy"; img.alt = ""; img.src = `https://i.ytimg.com/vi/${v.id}/mqdefault.jpg`;
+    const t = document.createElement("div"); t.className = "t"; t.textContent = v.title;
+    const m = document.createElement("div"); m.className = "m"; m.textContent = `${v.author} • ${ago(v.published)}`;
+    b.append(img, t, m);
+    b.onclick = () => play(v);
+    el.append(b);
+  }
+}
+
+async function refresh() {
+  if (!channels.length) return render();
+  $("refresh").textContent = "Loading…";
+  try {
+    const results = await Promise.allSettled(channels.map(async c => {
+      const r = await fetch(`${API}/feed?id=${c.id}`);
+      if (!r.ok) throw new Error(c.name);
+      const xml = new DOMParser().parseFromString(await r.text(), "text/xml");
+      return [...xml.getElementsByTagName("entry")].map(e => ({
+        id: e.getElementsByTagName("yt:videoId")[0].textContent,
+        title: e.getElementsByTagName("title")[0].textContent,
+        published: e.getElementsByTagName("published")[0].textContent,
+        author: c.name,
+      }));
+    }));
+    const ok = results.filter(r => r.status === "fulfilled").flatMap(r => r.value);
+    const failed = results.filter(r => r.status === "rejected").length;
+    if (ok.length) {
+      videos = ok.sort((a, b) => new Date(b.published) - new Date(a.published)).slice(0, 80);
+      save("videos", videos);
+    }
+    render(failed ? `${failed} channel${failed > 1 ? "s" : ""} failed to load.` : "");
+  } catch { render("Could not reach the feed. Showing the last saved list."); }
+  $("refresh").textContent = "Refresh";
+}
+
+function play(v) {
+  current = v; seen[v.id] = 1; save("seen", seen);
+  $("frame").src = `https://www.youtube-nocookie.com/embed/${v.id}?playsinline=1&rel=0&autoplay=1`;
+  $("player").classList.add("on");
+  $("yt").textContent = "Mark unwatched";
+}
+function closePlayer() {
+  $("frame").src = "about:blank";
+  $("player").classList.remove("on");
+  render();
+}
+$("close").onclick = closePlayer;
+$("yt").onclick = () => { delete seen[current.id]; save("seen", seen); closePlayer(); };
+
+function renderChannels() {
+  const box = $("chans"); box.textContent = "";
+  for (const c of channels) {
+    const row = document.createElement("div"); row.className = "row";
+    const n = document.createElement("span"); n.textContent = c.name;
+    const b = document.createElement("button"); b.textContent = "Remove";
+    b.onclick = () => { channels = channels.filter(x => x.id !== c.id); save("channels", channels); renderChannels(); };
+    row.append(n, b); box.append(row);
+  }
+}
+$("edit").onclick = () => { $("panel").classList.add("on"); renderChannels(); };
+$("done").onclick = () => {
+  $("panel").classList.remove("on");
+  videos = videos.filter(v => channels.some(c => c.name === v.author));
+  render(); refresh();
+};
+$("addBtn").onclick = async () => {
+  const val = $("handle").value.trim(); if (!val) return;
+  $("msg").textContent = "Looking up…";
+  try {
+    let ch;
+    if (/^UC[\w-]{22}$/.test(val)) ch = { id: val, name: val };
+    else {
+      const r = await fetch(`${API}/resolve?handle=${encodeURIComponent(val)}`);
+      if (!r.ok) throw 0;
+      ch = await r.json();
+    }
+    if (!channels.some(c => c.id === ch.id)) channels.push(ch);
+    save("channels", channels); $("handle").value = ""; $("msg").textContent = ""; renderChannels();
+  } catch { $("msg").textContent = "Couldn't find that channel. Check the handle or paste its UC… ID."; }
+};
+$("refresh").onclick = refresh;
+document.addEventListener("visibilitychange", () => { if (!document.hidden && !$("player").classList.contains("on")) refresh(); });
+
+if ("serviceWorker" in navigator) navigator.serviceWorker.register("sw.js").catch(() => {});
+render(); refresh();
+</script>
+</body>
+</html>
