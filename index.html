@@ -38,6 +38,11 @@ main{max-width:640px;margin:0 auto;padding:12px 16px 40px}
 #player .top{display:flex;justify-content:space-between;color:#fff;padding:4px 8px}
 #player button{color:#fff}
 #speed{font:inherit;color:#fff;background:#222;border:1px solid #444;border-radius:8px;padding:4px 8px}
+#toast{position:fixed;left:50%;transform:translateX(-50%);bottom:calc(env(safe-area-inset-bottom,0px) + 24px);background:#222;color:#fff;border-radius:20px;padding:8px 16px;font-size:14px;opacity:0;transition:opacity .2s;pointer-events:none}
+#toast{border:0;font:inherit;font-size:14px;max-width:calc(100% - 32px)}
+#toast.on{opacity:1;pointer-events:auto}
+#player .top{align-items:center;gap:4px}
+#player .top button{font-size:15px;padding:8px 6px}
 #slot{width:100%;aspect-ratio:16/9;background:#000}
 #slot iframe{width:100%;height:100%;border:0;display:block}
 #panel{position:fixed;inset:0;background:var(--bg);z-index:15;display:none;overflow:auto;padding:calc(env(safe-area-inset-top,0px) + 12px) 16px 40px}
@@ -58,8 +63,9 @@ input{font:inherit;width:100%;padding:10px 12px;border-radius:8px;border:1px sol
 <main id="list"></main>
 
 <div id="player">
-  <div class="top"><button id="close">Close</button><select id="speed" aria-label="Playback speed"><option>1</option><option>1.25</option><option>1.5</option><option>1.75</option><option>2</option></select><button id="toggle">Mark watched</button></div>
+  <div class="top"><button id="close">Close</button><select id="speed" aria-label="Playback speed"><option>1</option><option>1.25</option><option>1.5</option><option>1.75</option><option>2</option></select><button id="skipBtn">Skip: On</button><button id="toggle">Mark watched</button></div>
   <div id="slot"></div>
+  <button id="toast"></button>
 </div>
 
 <div id="panel"><div class="in">
@@ -82,6 +88,7 @@ let seen = load("seen", {});           // {videoId: 1}  finished or marked watch
 let progress = load("progress", {});   // {videoId: {t, d}}  partly watched
 let videos = load("videos", []);
 let speed = load("speed", 1.25);
+let segs = [], skipTimer = null, toastT = null, declined = new Set(), lastSkip = null, skipOn = load("skipOn", true);
 let current = null, player = null, timer = null, ytReady = null;
 
 const ago = d => {
@@ -157,6 +164,36 @@ function loadYT() {
   return ytReady;
 }
 
+// ---- SponsorBlock: skip sponsor reads, self-promo and subscribe reminders ----
+async function getSegs(id) {
+  segs = []; declined = new Set();
+  try {
+    const hash = [...new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(id)))]
+      .map(b => b.toString(16).padStart(2, "0")).join("").slice(0, 4); // only a 4-char prefix is sent
+    const cats = encodeURIComponent('["sponsor","selfpromo","interaction"]');
+    const r = await fetch(`https://sponsor.ajay.app/api/skipSegments/${hash}?categories=${cats}`);
+    if (!r.ok) return;
+    const hit = (await r.json()).find(x => x.videoID === id);
+    if (hit && current && current.id === id) segs = hit.segments.map(s => s.segment);
+  } catch {}
+}
+function toast(msg, ms = 2000) {
+  const t = $("toast"); t.textContent = msg; t.classList.add("on");
+  clearTimeout(toastT); toastT = setTimeout(() => t.classList.remove("on"), ms);
+}
+function skipCheck() {
+  if (!skipOn || !player || !player.getCurrentTime || !segs.length) return;
+  const t = player.getCurrentTime(), M = 3; // keep a 3s margin at each end in case a segment is marked badly
+  for (let i = 0; i < segs.length; i++) {
+    const from = segs[i][0] + M, to = segs[i][1] - M;
+    if (to - from < 2 || declined.has(i)) continue;
+    if (t >= from && t < to - 0.5) {
+      lastSkip = { t, i }; player.seekTo(to, true);
+      toast(`Skipped ${Math.round(to - t)}s · tap to go back`, 6000); break;
+    }
+  }
+}
+
 function updateToggle() { $("toggle").textContent = seen[current.id] ? "Mark unwatched" : "Mark watched"; }
 
 async function play(v) {
@@ -164,6 +201,7 @@ async function play(v) {
   $("player").classList.add("on");
   document.documentElement.classList.add("lock");
   updateToggle();
+  getSegs(v.id);
   const slot = $("slot"); slot.innerHTML = '<div id="yt"></div>';
   const start = !seen[v.id] && progress[v.id] ? Math.max(0, Math.floor(progress[v.id].t) - 3) : 0;
   try {
@@ -175,8 +213,8 @@ async function play(v) {
       events: {
         onReady: e => e.target.setPlaybackRate(speed),
         onStateChange: e => {
-          if (e.data === 1) { if (e.target.getPlaybackRate() !== speed) e.target.setPlaybackRate(speed); clearInterval(timer); timer = setInterval(saveProgress, 5000); }
-          else { clearInterval(timer); if (e.data === 2) saveProgress(); }
+          if (e.data === 1) { if (e.target.getPlaybackRate() !== speed) e.target.setPlaybackRate(speed); clearInterval(timer); timer = setInterval(saveProgress, 5000); clearInterval(skipTimer); skipTimer = setInterval(skipCheck, 500); }
+          else { clearInterval(timer); clearInterval(skipTimer); if (e.data === 2) saveProgress(); }
           if (e.data === 0) { seen[v.id] = 1; delete progress[v.id]; save("seen", seen); save("progress", progress); updateToggle(); }
         },
       },
@@ -199,7 +237,7 @@ function saveProgress() {
 
 function closePlayer(skipSave) {
   if (!skipSave) saveProgress();
-  clearInterval(timer);
+  clearInterval(timer); clearInterval(skipTimer); segs = []; declined = new Set(); lastSkip = null; $("toast").classList.remove("on");
   try { player && player.destroy(); } catch {}
   player = null;
   $("slot").textContent = "";
@@ -209,6 +247,13 @@ function closePlayer(skipSave) {
 }
 $("speed").value = String(speed);
 $("speed").onchange = () => { speed = parseFloat($("speed").value); save("speed", speed); if (player && player.setPlaybackRate) player.setPlaybackRate(speed); };
+const showSkip = () => { $("skipBtn").textContent = "Skip: " + (skipOn ? "On" : "Off"); };
+showSkip();
+$("skipBtn").onclick = () => { skipOn = !skipOn; save("skipOn", skipOn); showSkip(); toast(skipOn ? "Sponsor skipping on" : "Sponsor skipping off"); };
+$("toast").onclick = () => {
+  if (!lastSkip || !player) return;
+  declined.add(lastSkip.i); player.seekTo(lastSkip.t, true); lastSkip = null; $("toast").classList.remove("on");
+};
 $("close").onclick = () => closePlayer();
 $("toggle").onclick = () => {
   const id = current.id;
