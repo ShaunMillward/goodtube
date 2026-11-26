@@ -11,11 +11,12 @@
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
 <meta name="theme-color" content="#14181f">
 <style>
-:root{--bg:#f4f6f8;--card:#fff;--ink:#14181f;--mute:#667085;--line:#dde2e8;--acc:#0f766e;--seen:.45;color-scheme:light dark}
+:root{--bg:#f4f6f8;--card:#fff;--ink:#14181f;--mute:#667085;--line:#dde2e8;--acc:#0f766e;color-scheme:light dark}
 @media(prefers-color-scheme:dark){:root{--bg:#14181f;--card:#1c222b;--ink:#eef1f5;--mute:#98a2b3;--line:#2b3340;--acc:#5eead4}}
 *{box-sizing:border-box}
 html,body{margin:0;background:var(--bg);color:var(--ink);font:16px/1.4 -apple-system,system-ui,sans-serif}
 :root{padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}
+html.lock,html.lock body{overflow:hidden}
 header{position:sticky;top:env(safe-area-inset-top,0px);background:var(--bg);display:flex;align-items:center;justify-content:space-between;padding:12px 16px;border-bottom:1px solid var(--line);z-index:5}
 body::before{content:"";position:fixed;inset:0 0 auto;height:env(safe-area-inset-top,0px);background:var(--bg);z-index:10}
 h1{font-size:20px;margin:0}
@@ -24,17 +25,21 @@ button:focus-visible,a:focus-visible{outline:2px solid var(--acc);outline-offset
 .bar button{color:var(--acc);font-weight:600}
 main{max-width:640px;margin:0 auto;padding:12px 16px 40px}
 .v{display:block;width:100%;text-align:left;padding:0;margin:0 0 20px}
-.v img{width:100%;aspect-ratio:16/9;object-fit:cover;border-radius:10px;background:var(--line);display:block}
+.th{position:relative;border-radius:10px;overflow:hidden;background:var(--line)}
+.th img{width:100%;aspect-ratio:16/9;object-fit:cover;display:block}
+.th i{position:absolute;left:0;bottom:0;height:4px;background:var(--acc)}
 .v .t{margin:8px 2px 0;font-weight:600}
 .v .m{margin:2px 2px 0;color:var(--mute);font-size:14px}
-.v.seen{opacity:var(--seen)}
+.v.seen{opacity:.45}
 .empty,.err{color:var(--mute);padding:32px 0;text-align:center}
 .err{color:#b42318}
-#player{position:fixed;inset:0;background:#000;z-index:20;display:none;flex-direction:column;padding-top:env(safe-area-inset-top,0px)}
+#player{position:fixed;top:0;left:0;right:0;height:100dvh;background:#000;z-index:20;display:none;flex-direction:column;padding-top:env(safe-area-inset-top,0px);overscroll-behavior:none}
 #player.on{display:flex}
 #player .top{display:flex;justify-content:space-between;color:#fff;padding:4px 8px}
 #player button{color:#fff}
-#player iframe{border:0;width:100%;aspect-ratio:16/9}
+#speed{font:inherit;color:#fff;background:#222;border:1px solid #444;border-radius:8px;padding:4px 8px}
+#slot{width:100%;aspect-ratio:16/9;background:#000}
+#slot iframe{width:100%;height:100%;border:0;display:block}
 #panel{position:fixed;inset:0;background:var(--bg);z-index:15;display:none;overflow:auto;padding:calc(env(safe-area-inset-top,0px) + 12px) 16px 40px}
 #panel.on{display:block}
 #panel .in{max-width:640px;margin:0 auto}
@@ -53,8 +58,8 @@ input{font:inherit;width:100%;padding:10px 12px;border-radius:8px;border:1px sol
 <main id="list"></main>
 
 <div id="player">
-  <div class="top"><button id="close">Close</button><button id="yt">Mark unwatched</button></div>
-  <iframe id="frame" allow="autoplay; picture-in-picture; fullscreen" allowfullscreen referrerpolicy="strict-origin-when-cross-origin"></iframe>
+  <div class="top"><button id="close">Close</button><select id="speed" aria-label="Playback speed"><option>1</option><option>1.25</option><option>1.5</option><option>1.75</option><option>2</option></select><button id="toggle">Mark watched</button></div>
+  <div id="slot"></div>
 </div>
 
 <div id="panel"><div class="in">
@@ -65,7 +70,7 @@ input{font:inherit;width:100%;padding:10px 12px;border-radius:8px;border:1px sol
 </div></div>
 
 <script>
-// 1. After deploying the Worker, paste its URL here (no trailing slash).
+// Paste your Worker URL here (no trailing slash).
 const API = "https://late-mountain-f304.shaun-millward.workers.dev";
 
 const $ = id => document.getElementById(id);
@@ -73,9 +78,11 @@ const load = (k, d) => { try { return JSON.parse(localStorage.getItem(k)) ?? d; 
 const save = (k, v) => { try { localStorage.setItem(k, JSON.stringify(v)); } catch {} };
 
 let channels = load("channels", []);   // [{id, name}]
-let seen = load("seen", {});           // {videoId: 1}
-let videos = load("videos", []);       // cached feed
-let current = null;
+let seen = load("seen", {});           // {videoId: 1}  finished or marked watched
+let progress = load("progress", {});   // {videoId: {t, d}}  partly watched
+let videos = load("videos", []);
+let speed = load("speed", 1.25);
+let current = null, player = null, timer = null, ytReady = null;
 
 const ago = d => {
   const s = (Date.now() - new Date(d)) / 1000;
@@ -85,6 +92,7 @@ const ago = d => {
 };
 
 function render(error) {
+  const y = window.scrollY; // keep your place in the list
   const el = $("list");
   el.textContent = "";
   if (error) { const e = document.createElement("div"); e.className = "err"; e.textContent = error; el.append(e); }
@@ -95,14 +103,19 @@ function render(error) {
   for (const v of videos) {
     const b = document.createElement("button");
     b.className = "v" + (seen[v.id] ? " seen" : "");
+    const th = document.createElement("div"); th.className = "th";
     const img = document.createElement("img");
     img.loading = "lazy"; img.alt = ""; img.src = `https://i.ytimg.com/vi/${v.id}/mqdefault.jpg`;
+    th.append(img);
+    const p = progress[v.id];
+    if (p && !seen[v.id]) { const bar = document.createElement("i"); bar.style.width = Math.min(100, p.t / p.d * 100) + "%"; th.append(bar); }
     const t = document.createElement("div"); t.className = "t"; t.textContent = v.title;
     const m = document.createElement("div"); m.className = "m"; m.textContent = `${v.author} • ${ago(v.published)}`;
-    b.append(img, t, m);
+    b.append(th, t, m);
     b.onclick = () => play(v);
     el.append(b);
   }
+  window.scrollTo(0, y);
 }
 
 async function refresh() {
@@ -131,20 +144,86 @@ async function refresh() {
   $("refresh").textContent = "Refresh";
 }
 
-function play(v) {
-  current = v; seen[v.id] = 1; save("seen", seen);
-  $("frame").src = `https://www.youtube-nocookie.com/embed/${v.id}?playsinline=1&rel=0&autoplay=1`;
-  $("player").classList.add("on");
-  $("yt").textContent = "Mark unwatched";
+// ---- Player with progress tracking (YouTube IFrame API) ----
+function loadYT() {
+  if (ytReady) return ytReady;
+  ytReady = new Promise((res, rej) => {
+    if (window.YT && YT.Player) return res();
+    window.onYouTubeIframeAPIReady = res;
+    const s = document.createElement("script");
+    s.src = "https://www.youtube.com/iframe_api"; s.onerror = () => { ytReady = null; rej(); };
+    document.head.append(s);
+  });
+  return ytReady;
 }
-function closePlayer() {
-  $("frame").src = "about:blank";
+
+function updateToggle() { $("toggle").textContent = seen[current.id] ? "Mark unwatched" : "Mark watched"; }
+
+async function play(v) {
+  current = v;
+  $("player").classList.add("on");
+  document.documentElement.classList.add("lock");
+  updateToggle();
+  const slot = $("slot"); slot.innerHTML = '<div id="yt"></div>';
+  const start = !seen[v.id] && progress[v.id] ? Math.max(0, Math.floor(progress[v.id].t) - 3) : 0;
+  try {
+    await loadYT();
+    player = new YT.Player("yt", {
+      host: "https://www.youtube-nocookie.com",
+      width: "100%", height: "100%", videoId: v.id,
+      playerVars: { playsinline: 1, rel: 0, autoplay: 1, start, origin: location.origin },
+      events: {
+        onReady: e => e.target.setPlaybackRate(speed),
+        onStateChange: e => {
+          if (e.data === 1) { if (e.target.getPlaybackRate() !== speed) e.target.setPlaybackRate(speed); clearInterval(timer); timer = setInterval(saveProgress, 5000); }
+          else { clearInterval(timer); if (e.data === 2) saveProgress(); }
+          if (e.data === 0) { seen[v.id] = 1; delete progress[v.id]; save("seen", seen); save("progress", progress); updateToggle(); }
+        },
+      },
+    });
+  } catch {
+    // API blocked: plain embed, no progress tracking
+    slot.innerHTML = `<iframe allow="autoplay; picture-in-picture; fullscreen" allowfullscreen src="https://www.youtube-nocookie.com/embed/${v.id}?playsinline=1&rel=0&autoplay=1&start=${start}"></iframe>`;
+  }
+}
+
+function saveProgress() {
+  if (!player || !player.getCurrentTime || !current) return;
+  const t = player.getCurrentTime(), d = player.getDuration();
+  if (!d || !isFinite(t)) return;
+  const id = current.id;
+  if (t / d >= 0.9 || d - t < 45) { seen[id] = 1; delete progress[id]; }       // effectively finished
+  else if (t >= 15) { progress[id] = { t, d }; delete seen[id]; }               // real watching, not a peek
+  save("seen", seen); save("progress", progress);
+}
+
+function closePlayer(skipSave) {
+  if (!skipSave) saveProgress();
+  clearInterval(timer);
+  try { player && player.destroy(); } catch {}
+  player = null;
+  $("slot").textContent = "";
   $("player").classList.remove("on");
+  document.documentElement.classList.remove("lock");
   render();
 }
-$("close").onclick = closePlayer;
-$("yt").onclick = () => { delete seen[current.id]; save("seen", seen); closePlayer(); };
+$("speed").value = String(speed);
+$("speed").onchange = () => { speed = parseFloat($("speed").value); save("speed", speed); if (player && player.setPlaybackRate) player.setPlaybackRate(speed); };
+$("close").onclick = () => closePlayer();
+$("toggle").onclick = () => {
+  const id = current.id;
+  if (seen[id]) { delete seen[id]; delete progress[id]; } else { seen[id] = 1; delete progress[id]; }
+  save("seen", seen); save("progress", progress);
+  closePlayer(true);
+};
+// Save when the app is backgrounded or the screen locks
+document.addEventListener("visibilitychange", () => {
+  if (document.hidden) { if (player) saveProgress(); }
+  else if (!$("player").classList.contains("on")) refresh();
+});
+addEventListener("pagehide", () => { if (player) saveProgress(); });
 
+// ---- Channels ----
 function renderChannels() {
   const box = $("chans"); box.textContent = "";
   for (const c of channels) {
@@ -162,7 +241,7 @@ $("done").onclick = () => {
   render(); refresh();
 };
 $("addBtn").onclick = async () => {
-  const val = $("handle").value.trim(); if (!val) return;
+  const val = $("handle").value.trim().replace(/\/+$/, ""); if (!val) return;
   $("msg").textContent = "Looking up…";
   try {
     let ch;
@@ -177,7 +256,6 @@ $("addBtn").onclick = async () => {
   } catch { $("msg").textContent = "Couldn't find that channel. Check the handle or paste its UC… ID."; }
 };
 $("refresh").onclick = refresh;
-document.addEventListener("visibilitychange", () => { if (!document.hidden && !$("player").classList.contains("on")) refresh(); });
 
 if ("serviceWorker" in navigator) navigator.serviceWorker.register("sw.js").catch(() => {});
 render(); refresh();
