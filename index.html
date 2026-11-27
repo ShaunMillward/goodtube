@@ -44,6 +44,7 @@ main{max-width:640px;margin:0 auto;padding:12px 16px 40px}
 #player .top{align-items:center;gap:4px}
 #player .top button{font-size:15px;padding:8px 6px}
 #slot{width:100%;aspect-ratio:16/9;background:#000}
+@media(orientation:landscape){#slot{flex:1;min-height:0;aspect-ratio:auto}}
 #slot iframe{width:100%;height:100%;border:0;display:block}
 #panel{position:fixed;inset:0;background:var(--bg);z-index:15;display:none;overflow:auto;padding:calc(env(safe-area-inset-top,0px) + 12px) 16px 40px}
 #panel.on{display:block}
@@ -89,6 +90,7 @@ let progress = load("progress", {});   // {videoId: {t, d}}  partly watched
 let videos = load("videos", []);
 let speed = load("speed", 1.25);
 let segs = [], skipTimer = null, toastT = null, declined = new Set(), lastSkip = null, skipOn = load("skipOn", true);
+let ccDone = false;
 let current = null, player = null, timer = null, ytReady = null;
 
 const ago = d => {
@@ -130,8 +132,9 @@ async function refresh() {
   $("refresh").textContent = "Loading…";
   try {
     const results = await Promise.allSettled(channels.map(async c => {
-      const r = await fetch(`${API}/feed?id=${c.id}`);
-      if (!r.ok) throw new Error(c.name);
+      let r;
+      try { r = await fetch(`${API}/feed?id=${c.id}`); } catch { throw new Error(`${c.name} (no connection)`); }
+      if (!r.ok) throw new Error(`${c.name} (error ${r.status})`);
       const xml = new DOMParser().parseFromString(await r.text(), "text/xml");
       return [...xml.getElementsByTagName("entry")].map(e => ({
         id: e.getElementsByTagName("yt:videoId")[0].textContent,
@@ -141,12 +144,14 @@ async function refresh() {
       }));
     }));
     const ok = results.filter(r => r.status === "fulfilled").flatMap(r => r.value);
-    const failed = results.filter(r => r.status === "rejected").length;
+    const failedList = results.filter(r => r.status === "rejected").map(r => r.reason.message);
+    const failedNames = channels.filter((c, i) => results[i].status === "rejected").map(c => c.name);
     if (ok.length) {
-      videos = ok.sort((a, b) => new Date(b.published) - new Date(a.published)).slice(0, 80);
+      // keep last-known videos from any channel that failed this time
+      videos = ok.concat(videos.filter(v => failedNames.includes(v.author))).sort((a, b) => new Date(b.published) - new Date(a.published)).slice(0, 80);
       save("videos", videos);
     }
-    render(failed ? `${failed} channel${failed > 1 ? "s" : ""} failed to load.` : "");
+    render(failedList.length ? "Couldn't load: " + failedList.join(", ") : "");
   } catch { render("Could not reach the feed. Showing the last saved list."); }
   $("refresh").textContent = "Refresh";
 }
@@ -194,6 +199,9 @@ function skipCheck() {
   }
 }
 
+// Turn captions off by default (you can still switch them on from the player's CC button)
+function noCaps(p) { try { p.setOption("captions", "track", {}); } catch {} }
+
 function updateToggle() { $("toggle").textContent = seen[current.id] ? "Mark unwatched" : "Mark watched"; }
 
 async function play(v) {
@@ -201,7 +209,7 @@ async function play(v) {
   $("player").classList.add("on");
   document.documentElement.classList.add("lock");
   updateToggle();
-  getSegs(v.id);
+  getSegs(v.id); ccDone = false;
   const slot = $("slot"); slot.innerHTML = '<div id="yt"></div>';
   const start = !seen[v.id] && progress[v.id] ? Math.max(0, Math.floor(progress[v.id].t) - 3) : 0;
   try {
@@ -209,11 +217,12 @@ async function play(v) {
     player = new YT.Player("yt", {
       host: "https://www.youtube-nocookie.com",
       width: "100%", height: "100%", videoId: v.id,
-      playerVars: { playsinline: 1, rel: 0, autoplay: 1, start, origin: location.origin },
+      playerVars: { playsinline: 1, rel: 0, autoplay: 1, start, origin: location.origin, fs: 0, cc_load_policy: 0 },
       events: {
-        onReady: e => e.target.setPlaybackRate(speed),
+        onReady: e => { e.target.setPlaybackRate(speed); noCaps(e.target); },
         onStateChange: e => {
-          if (e.data === 1) { if (e.target.getPlaybackRate() !== speed) e.target.setPlaybackRate(speed); clearInterval(timer); timer = setInterval(saveProgress, 5000); clearInterval(skipTimer); skipTimer = setInterval(skipCheck, 500); }
+          if (e.data === 1) { if (e.target.getPlaybackRate() !== speed) e.target.setPlaybackRate(speed);
+            if (!ccDone) { ccDone = true; setTimeout(() => noCaps(e.target), 300); setTimeout(() => noCaps(e.target), 1500); } clearInterval(timer); timer = setInterval(saveProgress, 5000); clearInterval(skipTimer); skipTimer = setInterval(skipCheck, 500); }
           else { clearInterval(timer); clearInterval(skipTimer); if (e.data === 2) saveProgress(); }
           if (e.data === 0) { seen[v.id] = 1; delete progress[v.id]; save("seen", seen); save("progress", progress); updateToggle(); }
         },
@@ -221,7 +230,7 @@ async function play(v) {
     });
   } catch {
     // API blocked: plain embed, no progress tracking
-    slot.innerHTML = `<iframe allow="autoplay; picture-in-picture; fullscreen" allowfullscreen src="https://www.youtube-nocookie.com/embed/${v.id}?playsinline=1&rel=0&autoplay=1&start=${start}"></iframe>`;
+    slot.innerHTML = `<iframe allow="autoplay; picture-in-picture; fullscreen" allowfullscreen src="https://www.youtube-nocookie.com/embed/${v.id}?playsinline=1&rel=0&autoplay=1&fs=0&cc_load_policy=0&start=${start}"></iframe>`;
   }
 }
 
